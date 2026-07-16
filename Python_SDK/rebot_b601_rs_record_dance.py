@@ -75,25 +75,39 @@ CFG_PLAY_LOOP = True
 CFG_PRINT_ACTIONS = False
 CFG_LOG_LEVEL = "INFO"
 
-# 实时角度与温度显示。
-# Live angle and temperature telemetry.
+# 实时角度与温度面板。
+# Live angle/temperature dashboard.
 CFG_TELEMETRY_ENABLED = True
 CFG_TELEMETRY_HZ = 2.0
 
-# ----- 3. 温度监控 / Temperature monitoring -----
-# 达到警告温度时只显示标记，不停机。
-# Warning only; no shutdown.
-CFG_TEMP_WARNING_C = 70.0
+# 使用 ANSI 终端实时刷新整洁面板。
+# Refresh a clean full-screen dashboard in ANSI-compatible terminals.
+CFG_DASHBOARD_ENABLED = True
+CFG_DASHBOARD_CLEAR_SCREEN = True
+CFG_DASHBOARD_SHOW_KEYS = True
 
-# 分级显示阈值。
-# Staged visual warning thresholds.
-CFG_TEMP_ALERT_LEVEL_2_C = 85.0
-CFG_TEMP_ALERT_LEVEL_3_C = 110.0
-CFG_TEMP_ALERT_LEVEL_4_C = 125.0
+# 对每个电机执行“请求反馈 -> 兼容轮询 -> 读取状态”。
+# Request, poll, and read every motor individually for fresh feedback.
+CFG_FORCE_FRESH_FEEDBACK_PER_MOTOR = True
 
-# 任一电机的 MOS 或转子温度达到该值时自动停机。
-# Automatic shutdown when either MOS or rotor temperature reaches this value.
-CFG_TEMP_CRITICAL_C = 130.0
+# ----- 3. 温度保护：仅保留三个阈值 / Three temperature thresholds only -----
+# 1) 报警：只显示温度报警，不改变机械臂运动。
+#    Alarm only; motion continues.
+CFG_TEMP_ALARM_C = 80.0
+
+# 2) 回零：停止录制/播放/跟随，缓慢回到零点，随后断开电机。
+#    Stop the active motion, return slowly to zero, then disconnect.
+CFG_TEMP_RETURN_ZERO_C = 100.0
+
+# 3) 断开：立即中止运动并断开电机，不再继续回零。
+#    Immediately abort motion and disconnect; do not continue returning.
+CFG_TEMP_DISCONNECT_C = 140.0
+
+# 高温触发后的回零速度。建议比普通 Esc/Ctrl+C 回零更慢。
+# Return-to-zero speed after a thermal trigger. Keep this slower than
+# the normal Esc/Ctrl+C return speed.
+CFG_THERMAL_RETURN_ARM_MAX_SPEED_DEG_S = 8.0
+CFG_THERMAL_RETURN_GRIPPER_MAX_SPEED_DEG_S = 3.0
 
 # ----- 4. 录制与回放 / Recording and playback -----
 CFG_NUM_SLOTS = 5
@@ -258,8 +272,9 @@ class RSDanceRecorder:
         print_actions: bool = CFG_PRINT_ACTIONS,
         telemetry_enabled: bool = CFG_TELEMETRY_ENABLED,
         telemetry_hz: float = CFG_TELEMETRY_HZ,
-        temp_warning_c: float = CFG_TEMP_WARNING_C,
-        temp_critical_c: float = CFG_TEMP_CRITICAL_C,
+        temp_alarm_c: float = CFG_TEMP_ALARM_C,
+        temp_return_zero_c: float = CFG_TEMP_RETURN_ZERO_C,
+        temp_disconnect_c: float = CFG_TEMP_DISCONNECT_C,
     ) -> None:
         if control_hz <= 0:
             raise ValueError("control_hz 必须大于 0 / control_hz must be greater than zero")
@@ -276,20 +291,28 @@ class RSDanceRecorder:
             raise ValueError(
                 "telemetry_hz 必须大于 0 / telemetry_hz must be greater than zero"
             )
-        if temp_critical_c <= temp_warning_c:
+        if not (
+            temp_alarm_c < temp_return_zero_c < temp_disconnect_c
+        ):
             raise ValueError(
-                "危险停机温度必须高于警告温度 / "
-                "temp_critical_c must be greater than temp_warning_c"
+                "三个温度阈值必须满足：报警 < 回零 < 断开 / "
+                "Temperature thresholds must satisfy: alarm < return-zero < disconnect"
             )
 
         self.telemetry_enabled = bool(telemetry_enabled)
         self.telemetry_hz = float(telemetry_hz)
         self.telemetry_period_s = 1.0 / self.telemetry_hz
-        self.temp_warning_c = float(temp_warning_c)
-        self.temp_critical_c = float(temp_critical_c)
-        self.thermal_shutdown_requested = False
-        self.thermal_shutdown_motor: str | None = None
+        self.temp_alarm_c = float(temp_alarm_c)
+        self.temp_return_zero_c = float(temp_return_zero_c)
+        self.temp_disconnect_c = float(temp_disconnect_c)
+        self.thermal_return_requested = False
+        self.thermal_trigger_motor: str | None = None
         self._last_telemetry_line_length = 0
+
+        self._no_temperature_feedback_reported = False
+        self._all_zero_temperature_reported = False
+        self._dashboard_rendered_once = False
+        self._emergency_disconnect_requested = False
 
         self.motion_slots: list[list[MotionFrame]] = [
             [] for _ in range(self.NUM_SLOTS)
@@ -750,18 +773,59 @@ class RSDanceRecorder:
     @staticmethod
     def print_help() -> None:
         print(
-            "\n"
-            "========== reBot B601-RS 动作录制与跳舞回放 / Motion Recorder & Dance Playback ==========\n"
-            " q w e r t：先安全同步到主臂，再录制第 1～5 个动作槽位 / Safely sync, then record slots 1–5\n"
-            " 1 2 3 4 5：播放第 1～5 个动作槽位 / Play slots 1–5\n"
-            " s         ：停止录制/播放，并安全返回实时跟随 / Stop and safely return to live follow\n"
-            " f         ：实时主从跟随 / Live follow\n"
-            " c         ：清除当前选中的动作槽位 / Clear selected slot\n"
-            " a         ：清除全部动作槽位 / Clear all slots\n"
-            " Esc       ：停止当前动作并缓慢安全回到零点后退出 / Stop, return safely to zero, and exit\n"
-            " Ctrl+C    ：停止当前动作并缓慢安全回到零点 / Stop and return safely to zero\n"
-            "========================================================\n"
+            "\n[实时面板 / LIVE DASHBOARD] "
+            "连接完成后，按键、模式、电机角度、MOS 温度和三个温度阈值"
+            "会持续显示在终端。 / "
+            "After connection, keys, mode, motor angles, MOS temperatures, "
+            "and all three thresholds remain visible in the terminal.\n"
         )
+
+    def _read_max_mos_temperature(self) -> tuple[float | None, str | None]:
+        """Return the highest available RobStride MOS temperature."""
+        max_temp: float | None = None
+        max_motor: str | None = None
+
+        for motor_name in MOTOR_NAMES:
+            motor = self.follower.motors.get(motor_name)
+            if motor is None:
+                continue
+
+            try:
+                motor.request_feedback()
+            except Exception:
+                logger.debug(
+                    "请求高温回零反馈失败 / Thermal-return feedback request failed: %s",
+                    motor_name,
+                    exc_info=True,
+                )
+
+        poll_once = getattr(self.follower.bus, "poll_feedback_once", None)
+        if callable(poll_once):
+            try:
+                poll_once()
+            except Exception:
+                logger.debug(
+                    "高温回零反馈轮询失败 / Thermal-return feedback poll failed",
+                    exc_info=True,
+                )
+
+        for motor_name in MOTOR_NAMES:
+            motor = self.follower.motors.get(motor_name)
+            if motor is None:
+                continue
+            try:
+                state = motor.get_state()
+            except Exception:
+                continue
+            if state is None:
+                continue
+
+            temp = self._safe_float(getattr(state, "t_mos", None))
+            if temp is not None and (max_temp is None or temp > max_temp):
+                max_temp = temp
+                max_motor = motor_name
+
+        return max_temp, max_motor
 
     def _safe_return_to_zero(self) -> None:
         """Slowly return every action-space joint to zero before disconnecting.
@@ -787,12 +851,24 @@ class RSDanceRecorder:
         target = {key: 0.0 for key in ACTION_KEYS}
         # smoothstep has a peak slope of 1.5, so multiply the nominal
         # delta/speed duration by 1.5 to enforce the requested *peak* speed.
+        thermal_return = self.thermal_return_requested
+        arm_speed_limit = (
+            CFG_THERMAL_RETURN_ARM_MAX_SPEED_DEG_S
+            if thermal_return
+            else self.RETURN_ZERO_ARM_MAX_SPEED_DEG_S
+        )
+        gripper_speed_limit = (
+            CFG_THERMAL_RETURN_GRIPPER_MAX_SPEED_DEG_S
+            if thermal_return
+            else self.RETURN_ZERO_GRIPPER_MAX_SPEED_DEG_S
+        )
+
         required_times: list[float] = []
         for key in ACTION_KEYS:
             speed_limit = (
-                self.RETURN_ZERO_GRIPPER_MAX_SPEED_DEG_S
+                gripper_speed_limit
                 if key == "gripper.pos"
-                else self.RETURN_ZERO_ARM_MAX_SPEED_DEG_S
+                else arm_speed_limit
             )
             required_times.append(
                 1.5 * abs(start[key] - target[key]) / speed_limit
@@ -801,19 +877,47 @@ class RSDanceRecorder:
         duration_s = max(self.RETURN_ZERO_MIN_TIME_S, *required_times)
         steps = max(2, int(round(duration_s * self.control_hz)))
 
+        return_reason = (
+            "高温触发 / thermal trigger"
+            if thermal_return
+            else "人工退出 / manual exit"
+        )
         print(
             "[回零 / RETURN] 正在缓慢回到零点。 / Slowly returning to zero. "
+            f"原因 / reason: {return_reason}. "
             f"预计需要 {duration_s:.1f} 秒。 / Estimated time: {duration_s:.1f} s. "
-            f"（机械臂关节峰值速度 ≤ {self.RETURN_ZERO_ARM_MAX_SPEED_DEG_S:.1f} 度/秒， / Arm peak speed ≤ {self.RETURN_ZERO_ARM_MAX_SPEED_DEG_S:.1f} deg/s; "
-            f"夹爪峰值速度 ≤ {self.RETURN_ZERO_GRIPPER_MAX_SPEED_DEG_S:.1f} 度/秒。） / gripper peak speed ≤ {self.RETURN_ZERO_GRIPPER_MAX_SPEED_DEG_S:.1f} deg/s."
+            f"（机械臂关节峰值速度 ≤ {arm_speed_limit:.1f} 度/秒， / "
+            f"Arm peak speed ≤ {arm_speed_limit:.1f} deg/s; "
+            f"夹爪峰值速度 ≤ {gripper_speed_limit:.1f} 度/秒。） / "
+            f"gripper peak speed ≤ {gripper_speed_limit:.1f} deg/s."
         )
         print("[回零 / RETURN] 回零过程中再次按 Ctrl+C，可立即中止并断开电机。 / Press Ctrl+C again to abort immediately and disconnect the motors.")
 
         next_tick = time.monotonic()
+        last_thermal_check = -float("inf")
         for i in range(1, steps + 1):
             if self.abort_return_to_zero:
                 print("[回零 / RETURN] 检测到第二次 Ctrl+C，已中止回零。 / Second Ctrl+C detected; return-to-zero aborted.")
                 return
+
+            if (
+                thermal_return
+                and time.monotonic() - last_thermal_check >= self.telemetry_period_s
+            ):
+                last_thermal_check = time.monotonic()
+                max_temp, max_motor = self._read_max_mos_temperature()
+                if max_temp is not None and max_temp >= self.temp_disconnect_c:
+                    print(
+                        "\n[紧急断电 / EMERGENCY DISCONNECT] "
+                        f"{max_motor or 'unknown'} 的 MOS 温度升至 "
+                        f"{max_temp:.1f}°C，达到断开阈值 "
+                        f"{self.temp_disconnect_c:.1f}°C。立即中止回零并断电。 / "
+                        f"{max_motor or 'unknown'} MOS temperature rose to "
+                        f"{max_temp:.1f}°C, reaching the disconnect threshold "
+                        f"{self.temp_disconnect_c:.1f}°C. "
+                        "Aborting return-to-zero and disconnecting immediately."
+                    )
+                    return
 
             alpha = self._smoothstep(i / steps)
             self._send_action(self._lerp_action(start, target, alpha))
@@ -838,146 +942,256 @@ class RSDanceRecorder:
             return None
         return number if math.isfinite(number) else None
 
-    def _temperature_marker(self, temperature_c: float | None) -> str:
-        """Compact staged warning marker without repeatedly printing log lines."""
-        if temperature_c is None:
-            return ""
-        if temperature_c >= self.temp_critical_c:
-            return "XXXXX"
-        if temperature_c >= CFG_TEMP_ALERT_LEVEL_4_C:
-            return "!!!!"
-        if temperature_c >= CFG_TEMP_ALERT_LEVEL_3_C:
-            return "!!!"
-        if temperature_c >= CFG_TEMP_ALERT_LEVEL_2_C:
-            return "!!"
-        if temperature_c >= self.temp_warning_c:
-            return "!"
-        return ""
+    def _mode_dashboard_text(self) -> str:
+        """Return a concise live mode/slot description."""
+        if self.mode == Mode.RECORD and self.record_slot is not None:
+            return f"正在录制动作 {self.record_slot + 1} / RECORDING SLOT {self.record_slot + 1}"
+        if self.mode in (Mode.PLAYBACK, Mode.TRANSITION) and self.play_slot is not None:
+            return f"正在播放动作 {self.play_slot + 1} / PLAYING SLOT {self.play_slot + 1}"
+        if self.mode == Mode.SYNC_TO_LEADER:
+            if self.pending_record_slot is not None:
+                return (
+                    f"同步后录制动作 {self.pending_record_slot + 1} / "
+                    f"SYNC THEN RECORD SLOT {self.pending_record_slot + 1}"
+                )
+            return "安全同步到主臂 / SAFE SYNC TO LEADER"
+        return "实时跟随 / LIVE FOLLOW"
+
+    def _slot_dashboard_text(self) -> str:
+        """Show whether each of the five in-memory motion slots has data."""
+        return "  ".join(
+            f"{index + 1}:{'有/SET' if frames else '空/EMPTY'}"
+            for index, frames in enumerate(self.motion_slots)
+        )
+
+    def _render_dashboard(
+        self,
+        motor_parts: list[str],
+        alarm_text: str,
+        *,
+        feedback_note: str = "",
+    ) -> None:
+        """Render a compact real-time terminal panel with persistent key help."""
+        if not CFG_DASHBOARD_ENABLED:
+            line = (
+                f"[状态 / TELEMETRY][{self._mode_dashboard_text()}] "
+                + " | ".join(motor_parts)
+            )
+            print(f"\r{line}", end="", flush=True)
+            self._last_telemetry_line_length = len(line)
+            return
+
+        if CFG_DASHBOARD_CLEAR_SCREEN and sys.stdout.isatty():
+            # Clear the screen and return to the top-left corner.
+            sys.stdout.write("\033[2J\033[H")
+
+        separator = "=" * 112
+        thin_separator = "-" * 112
+
+        first_motor_row = " | ".join(motor_parts[:4])
+        second_motor_row = " | ".join(motor_parts[4:])
+
+        lines = [
+            separator,
+            "reBot B601-RS 实时控制面板 / LIVE CONTROL DASHBOARD",
+            f"模式 / MODE      : {self._mode_dashboard_text()}",
+            f"动作槽 / SLOTS   : {self._slot_dashboard_text()}",
+            (
+                "温度阈值 / TEMP : "
+                f"报警 ALARM={self.temp_alarm_c:.1f}°C  |  "
+                f"回零 RETURN={self.temp_return_zero_c:.1f}°C  |  "
+                f"断开 DISCONNECT={self.temp_disconnect_c:.1f}°C"
+            ),
+            thin_separator,
+            f"电机 / MOTORS 1-4: {first_motor_row}",
+            f"电机 / MOTORS 5-G: {second_motor_row}",
+            thin_separator,
+        ]
+
+        if CFG_DASHBOARD_SHOW_KEYS:
+            lines.extend(
+                [
+                    "按键 / KEYS      : Q/W/E/R/T 录制动作1-5  |  1/2/3/4/5 播放动作1-5  |  S 停止  |  F 跟随",
+                    "                   C 清除当前槽  |  A 清除全部槽  |  Esc / Ctrl+C 安全回零并退出",
+                    thin_separator,
+                ]
+            )
+
+        lines.append(f"温度状态 / TEMP : {alarm_text}")
+        if feedback_note:
+            lines.append(f"反馈提示 / NOTE : {feedback_note}")
+        lines.append(separator)
+
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        self._dashboard_rendered_once = True
+        self._last_telemetry_line_length = 0
 
     def _read_and_display_motor_telemetry(self) -> bool:
-        """Read RobStride angle/MOS/rotor temperature and refresh one terminal line.
-
-        Returns False when the configured critical temperature is reached.
-        Feedback follows the MotorBridge pattern:
-            motor.request_feedback()
-            state = motor.get_state()
-        """
-        # Request all motors first to reduce multi-motor feedback jitter.
-        for motor_name in MOTOR_NAMES:
-            motor = self.follower.motors.get(motor_name)
-            if motor is not None:
-                try:
-                    motor.request_feedback()
-                except Exception:
-                    logger.debug(
-                        "请求电机反馈失败 / Failed to request feedback: %s",
-                        motor_name,
-                        exc_info=True,
-                    )
-
-        # Newer MotorBridge versions normally poll feedback in the background.
-        # Keep one compatibility poll when the bus exposes this method.
+        """Read fresh RobStride position/MOS data and apply three thresholds."""
         poll_once = getattr(self.follower.bus, "poll_feedback_once", None)
-        if callable(poll_once):
-            try:
-                poll_once()
-            except Exception:
-                logger.debug(
-                    "兼容反馈轮询失败 / Compatibility feedback poll failed",
-                    exc_info=True,
-                )
-
-        parts: list[str] = []
-        critical_events: list[tuple[str, float, float]] = []
+        states: dict[str, Any] = {}
 
         for motor_name in MOTOR_NAMES:
-            short_name = MOTOR_SHORT_NAMES[motor_name]
             motor = self.follower.motors.get(motor_name)
-
             if motor is None:
-                parts.append(f"{short_name}:无电机/no motor")
+                states[motor_name] = None
                 continue
 
             try:
-                state = motor.get_state()
+                motor.request_feedback()
+                if CFG_FORCE_FRESH_FEEDBACK_PER_MOTOR and callable(poll_once):
+                    poll_once()
+                states[motor_name] = motor.get_state()
             except Exception:
                 logger.debug(
-                    "读取电机状态失败 / Failed to read motor state: %s",
+                    "读取电机反馈失败 / Failed to read motor feedback: %s",
                     motor_name,
                     exc_info=True,
                 )
-                state = None
+                states[motor_name] = None
+
+        motor_parts: list[str] = []
+        valid_temperatures: list[tuple[str, float]] = []
+
+        for motor_name in MOTOR_NAMES:
+            short_name = MOTOR_SHORT_NAMES[motor_name]
+            state = states.get(motor_name)
 
             if state is None:
-                parts.append(f"{short_name}:无反馈/no data")
+                motor_parts.append(f"{short_name}: 无反馈 / NO DATA")
                 continue
 
             pos_rad = self._safe_float(getattr(state, "pos", None))
             mos_c = self._safe_float(getattr(state, "t_mos", None))
-            rotor_c = self._safe_float(getattr(state, "t_rotor", None))
 
             pos_deg = math.degrees(pos_rad) if pos_rad is not None else None
-            hottest = max(
-                (value for value in (mos_c, rotor_c) if value is not None),
-                default=None,
-            )
-            marker = self._temperature_marker(hottest)
-
             pos_text = "--.-°" if pos_deg is None else f"{pos_deg:+.1f}°"
-            mos_text = "--.-" if mos_c is None else f"{mos_c:.1f}"
-            rotor_text = "--.-" if rotor_c is None else f"{rotor_c:.1f}"
+            mos_text = "--.-°C" if mos_c is None else f"{mos_c:.1f}°C"
 
-            parts.append(
-                f"{marker}{short_name}:{pos_text} {mos_text}/{rotor_text}C"
+            motor_parts.append(f"{short_name} {pos_text}  MOS {mos_text}")
+
+            if mos_c is not None:
+                valid_temperatures.append((motor_name, mos_c))
+
+        feedback_note = ""
+        if not valid_temperatures:
+            feedback_note = (
+                "未读取到有效 t_mos，温度保护不可用 / "
+                "No valid t_mos; thermal protection unavailable"
             )
+            self._no_temperature_feedback_reported = True
+        elif all(abs(temp) < 1e-9 for _, temp in valid_temperatures):
+            feedback_note = (
+                "所有 MOS 温度均为 0.0°C，反馈可能没有更新 / "
+                "All MOS values are 0.0°C; feedback may be stale"
+            )
+            self._all_zero_temperature_reported = True
 
-            if hottest is not None and hottest >= self.temp_critical_c:
-                critical_events.append(
-                    (
-                        motor_name,
-                        mos_c if mos_c is not None else float("nan"),
-                        rotor_c if rotor_c is not None else float("nan"),
-                    )
+        if valid_temperatures:
+            hottest_motor, hottest_temp = max(
+                valid_temperatures,
+                key=lambda item: item[1],
+            )
+            hottest_short = MOTOR_SHORT_NAMES.get(hottest_motor, hottest_motor)
+        else:
+            hottest_motor = ""
+            hottest_temp = None
+            hottest_short = "--"
+
+        # Highest priority: immediate disconnect.
+        disconnect_events = [
+            (name, temp)
+            for name, temp in valid_temperatures
+            if temp >= self.temp_disconnect_c
+        ]
+        if disconnect_events:
+            alarm_text = (
+                "立即断开 / IMMEDIATE DISCONNECT | "
+                + " | ".join(
+                    f"{MOTOR_SHORT_NAMES.get(name, name)}={temp:.1f}°C"
+                    for name, temp in disconnect_events
                 )
-
-        mode_label = MODE_CN_LABELS.get(self.mode, self.mode.value)
-        line = (
-            f"[状态 / TELEMETRY][{mode_label}] "
-            f"角度；温度=MOS/转子 / angle; temp=MOS/rotor | "
-            + " | ".join(parts)
-        )
-
-        # Overwrite the previous telemetry row instead of continuously adding lines.
-        padding = " " * max(0, self._last_telemetry_line_length - len(line))
-        print(f"\r{line}{padding}", end="", flush=True)
-        self._last_telemetry_line_length = len(line)
-
-        if critical_events:
-            print()
-            for motor_name, mos_c, rotor_c in critical_events:
-                print(
-                    "[高温停机 / THERMAL SHUTDOWN] "
-                    f"{motor_name} 达到危险温度：MOS={mos_c:.1f}°C，"
-                    f"转子={rotor_c:.1f}°C；停机阈值={self.temp_critical_c:.1f}°C。 / "
-                    f"{motor_name} reached the critical temperature: "
-                    f"MOS={mos_c:.1f}°C, rotor={rotor_c:.1f}°C; "
-                    f"shutdown threshold={self.temp_critical_c:.1f}°C."
-                )
-
+            )
+            self._render_dashboard(
+                motor_parts,
+                alarm_text,
+                feedback_note=feedback_note,
+            )
             print(
-                "[高温停机 / THERMAL SHUTDOWN] "
-                "正在停止动作并断开电机。高温时不会自动回零，"
-                "请立即扶住机械臂。 / "
-                "Stopping motion and disconnecting motors. "
-                "The arm will not return to zero while overheated; support it immediately."
+                "\n[紧急断开 / EMERGENCY DISCONNECT] "
+                f"MOS 温度达到 {self.temp_disconnect_c:.1f}°C，"
+                "立即停止并断开电机，不再执行回零。 / "
+                f"MOS temperature reached {self.temp_disconnect_c:.1f}°C; "
+                "stopping and disconnecting immediately without returning to zero."
             )
-            self.thermal_shutdown_requested = True
-            self.thermal_shutdown_motor = critical_events[0][0]
-            # Continuing to move back to zero at 135°C could add more heat.
+            self._emergency_disconnect_requested = True
+            self.thermal_return_requested = False
             self.return_zero_on_exit = False
             self.running = False
             return False
 
+        # Second priority: controlled return to zero.
+        return_events = [
+            (name, temp)
+            for name, temp in valid_temperatures
+            if temp >= self.temp_return_zero_c
+        ]
+        if return_events:
+            alarm_text = (
+                "触发安全回零 / SAFE RETURN TRIGGERED | "
+                + " | ".join(
+                    f"{MOTOR_SHORT_NAMES.get(name, name)}={temp:.1f}°C"
+                    for name, temp in return_events
+                )
+            )
+            self._render_dashboard(
+                motor_parts,
+                alarm_text,
+                feedback_note=feedback_note,
+            )
+            print(
+                "\n[高温回零 / THERMAL RETURN] "
+                f"MOS 温度达到 {self.temp_return_zero_c:.1f}°C，"
+                "停止当前动作并缓慢回到零点；到达零点后断开电机。 / "
+                f"MOS temperature reached {self.temp_return_zero_c:.1f}°C; "
+                "stopping the current motion, returning slowly to zero, "
+                "then disconnecting."
+            )
+            self.thermal_return_requested = True
+            self.thermal_trigger_motor = return_events[0][0]
+            self.return_zero_on_exit = True
+            self.running = False
+            return False
+
+        # Lowest priority: alarm only.
+        alarm_events = [
+            (name, temp)
+            for name, temp in valid_temperatures
+            if temp >= self.temp_alarm_c
+        ]
+        if alarm_events:
+            alarm_text = (
+                f"温度报警，机械臂继续运行 / ALARM, MOTION CONTINUES | "
+                f"报警值={self.temp_alarm_c:.1f}°C | "
+                + " | ".join(
+                    f"{MOTOR_SHORT_NAMES.get(name, name)}={temp:.1f}°C"
+                    for name, temp in alarm_events
+                )
+            )
+        elif hottest_temp is not None:
+            alarm_text = (
+                f"正常 / NORMAL | 最高温度 / MAX: "
+                f"{hottest_short}={hottest_temp:.1f}°C"
+            )
+        else:
+            alarm_text = "无有效温度反馈 / NO VALID TEMPERATURE DATA"
+
+        self._render_dashboard(
+            motor_parts,
+            alarm_text,
+            feedback_note=feedback_note,
+        )
         return True
 
     def run(self) -> None:
@@ -1111,8 +1325,9 @@ class RSDanceRecorder:
             except Exception:
                 logger.exception("停止键盘监听器失败 / Failed to stop the keyboard listener")
 
-        # Returning to zero is opt-in. Never attempt it after a communication
-        # or control exception, because moving after a fault may be unsafe.
+        # Manual Esc/Ctrl+C and the configured thermal threshold request
+        # a controlled return to zero. Communication/control exceptions still
+        # skip return-to-zero because feedback may be unreliable.
         if normal_exit and self.return_zero_on_exit:
             try:
                 self._safe_return_to_zero()
@@ -1163,7 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-telemetry",
         action="store_true",
         default=not CFG_TELEMETRY_ENABLED,
-        help="关闭电机角度和温度实时显示。 / Disable live motor angle and temperature display.",
+        help="关闭电机角度和 MOS 温度实时显示。 / Disable live motor angle and MOS-temperature display.",
     )
     parser.add_argument(
         "--telemetry-hz",
@@ -1172,16 +1387,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="电机状态显示刷新频率，默认 2 Hz。 / Telemetry refresh rate; default: 2 Hz.",
     )
     parser.add_argument(
+        "--temp-alarm",
         "--temp-warning",
+        dest="temp_alarm",
         type=float,
-        default=CFG_TEMP_WARNING_C,
-        help="温度警告阈值，默认 70°C，仅显示警告标记。 / Warning threshold; default: 70°C.",
+        default=CFG_TEMP_ALARM_C,
+        help=(
+            f"只报警、不改变运动，默认 {CFG_TEMP_ALARM_C:.1f}°C。 / "
+            f"Alarm only; default: {CFG_TEMP_ALARM_C:.1f}°C."
+        ),
     )
     parser.add_argument(
+        "--temp-return",
         "--temp-critical",
+        dest="temp_return_zero",
         type=float,
-        default=CFG_TEMP_CRITICAL_C,
-        help="自动停机温度，默认 135°C。 / Automatic shutdown temperature; default: 135°C.",
+        default=CFG_TEMP_RETURN_ZERO_C,
+        help=(
+            f"触发安全回零，默认 {CFG_TEMP_RETURN_ZERO_C:.1f}°C。 / "
+            f"Trigger safe return-to-zero; default: {CFG_TEMP_RETURN_ZERO_C:.1f}°C."
+        ),
+    )
+    parser.add_argument(
+        "--temp-disconnect",
+        "--temp-emergency",
+        dest="temp_disconnect",
+        type=float,
+        default=CFG_TEMP_DISCONNECT_C,
+        help=(
+            f"立即断开电机，默认 {CFG_TEMP_DISCONNECT_C:.1f}°C。 / "
+            f"Disconnect immediately; default: {CFG_TEMP_DISCONNECT_C:.1f}°C."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -1200,11 +1436,16 @@ def main() -> int:
     _silence_repeated_relative_goal_clamp_warning()
 
     print(
+        "[运行文件 / RUNNING FILE] "
+        f"{__file__}"
+    )
+
+    print(
         "[启动配置 / STARTUP CONFIG] "
         f"leader={args.leader_port}, follower={args.follower_port}, "
         f"control={args.control_hz:.1f} Hz, telemetry="
         f"{'ON' if not args.no_telemetry else 'OFF'}, "
-        f"temperature shutdown={args.temp_critical:.1f}°C."
+        f"thermal return={args.temp_return_zero:.1f}°C, emergency={args.temp_disconnect:.1f}°C."
     )
 
     # Disable LeRobot's additional per-cycle catch-up clamp by default.
@@ -1276,11 +1517,13 @@ def main() -> int:
 
         print(
             "[温度监控 / TEMPERATURE] "
-            f"警告阈值={args.temp_warning:.1f}°C，"
-            f"自动停机阈值={args.temp_critical:.1f}°C，"
+            f"报警={args.temp_alarm:.1f}°C，"
+            f"回零={args.temp_return_zero:.1f}°C，"
+            f"断开={args.temp_disconnect:.1f}°C，"
             f"刷新频率={args.telemetry_hz:.1f} Hz。 / "
-            f"warning={args.temp_warning:.1f}°C, "
-            f"shutdown={args.temp_critical:.1f}°C, "
+            f"warning={args.temp_alarm:.1f}°C, "
+            f"safe-return={args.temp_return_zero:.1f}°C, "
+            f"emergency-disconnect={args.temp_disconnect:.1f}°C, "
             f"refresh={args.telemetry_hz:.1f} Hz."
         )
 
@@ -1293,8 +1536,9 @@ def main() -> int:
             print_actions=args.print_actions,
             telemetry_enabled=not args.no_telemetry,
             telemetry_hz=args.telemetry_hz,
-            temp_warning_c=args.temp_warning,
-            temp_critical_c=args.temp_critical,
+            temp_alarm_c=args.temp_alarm,
+            temp_return_zero_c=args.temp_return_zero,
+            temp_disconnect_c=args.temp_disconnect,
         )
         controller.run()
         normal_exit = True
